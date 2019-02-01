@@ -1,0 +1,9 @@
+[package]
+
+name="probe1"
+version="0.0.1"
+authors = ["vldmeweider"]
+
+[dependencies]
+
+rand="*"
