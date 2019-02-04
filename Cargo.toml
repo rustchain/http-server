@@ -1,9 +1,8 @@
 [package]
 
-name="probe1"
+name="rcnode"
 version="0.0.1"
 authors = ["vldmeweider"]
 
-[dependencies]
-
-rand="*"
+[dependencies.mio]
+git = "https://github.com/carllerche/mio"
