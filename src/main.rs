@@ -1,54 +1,57 @@
+extern crate config;
 extern crate mio;
 
 use mio::*;
 use mio::tcp::{TcpListener, TcpStream};
 
-// Setup some tokens to allow us to identify which event is
-// for which socket.
+// tokens identify event
 const SERVER: Token = Token(0);
 const CLIENT: Token = Token(1);
 
 fn main() {
+    let mut settings = config::Config::default();
+    settings
+        // add Settings.toml
+        .merge(config::File::with_name("Settings")).unwrap()
+        // add environment prefix APP
+        .merge(config::Environment::with_prefix("APP")).unwrap();
 
-let addr = "127.0.0.1:13265".parse().unwrap();
+    let listen = settings.get_str("listen").unwrap();
+    let addr = listen.parse().unwrap();
+    let sock = TcpStream::connect(&addr).unwrap();
 
-// Setup the server socket
-let server = TcpListener::bind(&addr).unwrap();
+    let server = TcpListener::bind(&addr).unwrap();
 
-// Create an poll instance
-let mut poll = Poll::new().unwrap();
+    let poll = Poll::new().unwrap();
 
-// Start listening for incoming connections
-poll.register(&server, SERVER, Ready::readable(),
-              PollOpt::edge()).unwrap();
+    poll.register(&server, SERVER, Ready::readable(),
+                  PollOpt::edge()).unwrap();
 
-// Setup the client socket
-let sock = TcpStream::connect(&addr).unwrap();
+    poll.register(&sock, CLIENT, Ready::readable(),
+                  PollOpt::edge()).unwrap();
 
-// Register the socket
-poll.register(&sock, CLIENT, Ready::readable(),
-              PollOpt::edge()).unwrap();
+    // events storage
+    let mut events = Events::with_capacity(1024);
 
-// Create storage for events
-let mut events = Events::with_capacity(1024);
+    loop {
+        poll.poll(&mut events, None).unwrap();
 
-loop {
-    poll.poll(&mut events, None).unwrap();
-
-    for event in events.iter() {
-        match event.token() {
-            SERVER => {
-                // Accept and drop the socket immediately, this will close
-                // the socket and notify the client of the EOF.
-                let _ = server.accept();
+        for event in events.iter() {
+            match event.token() {
+                SERVER => {
+                    println!("SERVER");
+                    // Accept and drop the socket immediately, this will close
+                    // the socket and notify the client of the EOF.
+                    let _ = server.accept();
+                }
+                CLIENT => {
+                    println!("CLIENT");
+                    // The server just shuts down the socket, let's just exit
+                    // from our event loop.
+                    //return;
+                }
+                _ => unreachable!(),
             }
-            CLIENT => {
-                // The server just shuts down the socket, let's just exit
-                // from our event loop.
-                return;
-            }
-            _ => unreachable!(),
         }
     }
-}
 }

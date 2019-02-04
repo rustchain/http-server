@@ -4,5 +4,8 @@ name="rcnode"
 version="0.0.1"
 authors = ["vldmeweider"]
 
+[dependencies]
+config = "0.9"
+
 [dependencies.mio]
 git = "https://github.com/carllerche/mio"
