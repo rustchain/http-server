@@ -2,10 +2,10 @@
 
 name="rcnode"
 version="0.0.1"
-authors = ["vldmeweider"]
+authors = ["vldmrweider"]
 
 [dependencies]
-config = "0.9"
+tokio = "0.1"
+futures = "0.1.20"
 
-[dependencies.mio]
-git = "https://github.com/carllerche/mio"
+

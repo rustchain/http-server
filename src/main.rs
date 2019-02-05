@@ -1,57 +1,133 @@
-extern crate config;
-extern crate mio;
+#![deny(warnings)]
 
-use mio::*;
-use mio::tcp::{TcpListener, TcpStream};
+extern crate tokio;
+extern crate futures;
 
-// tokens identify event
-const SERVER: Token = Token(0);
-const CLIENT: Token = Token(1);
+use tokio::io;
+use tokio::net::TcpListener;
+use tokio::prelude::*;
 
-fn main() {
-    let mut settings = config::Config::default();
-    settings
-        // add Settings.toml
-        .merge(config::File::with_name("Settings")).unwrap()
-        // add environment prefix APP
-        .merge(config::Environment::with_prefix("APP")).unwrap();
+use std::collections::HashMap;
+use std::iter;
+use std::env;
+use std::io::{BufReader};
+use std::sync::{Arc, Mutex};
 
-    let listen = settings.get_str("listen").unwrap();
-    let addr = listen.parse().unwrap();
-    let sock = TcpStream::connect(&addr).unwrap();
+fn main() -> Result<(), Box<std::error::Error>> {
 
-    let server = TcpListener::bind(&addr).unwrap();
+    //TCP listener
+    let addr = env::args().nth(1).unwrap_or("127.0.0.1:17771".to_string());
+    let addr = addr.parse()?;
+    let socket = TcpListener::bind(&addr)?;
+    println!("Start RCNode");
+    println!("listening on: {}", addr);
 
-    let poll = Poll::new().unwrap();
 
-    poll.register(&server, SERVER, Ready::readable(),
-                  PollOpt::edge()).unwrap();
+    // Run Tokio runtime multi-threaded
+    // Arc<Mutex shared across the threads
+    let connections = Arc::new(Mutex::new(HashMap::new()));
 
-    poll.register(&sock, CLIENT, Ready::readable(),
-                  PollOpt::edge()).unwrap();
+    // The server task asynchronously iterates over and processes each incoming
+    // connection.
+    let srv = socket.incoming()
+        .map_err(|e| {println!("failed to accept socket; error = {:?}", e); e})
+        .for_each(move |stream| {
+            // The client's socket address
+            let addr = stream.peer_addr()?;
 
-    // events storage
-    let mut events = Events::with_capacity(1024);
+            println!("New Connection: {}", addr);
 
-    loop {
-        poll.poll(&mut events, None).unwrap();
+            // Split the TcpStream into two separate handles. One handle for reading
+            // and one handle for writing. This lets us use separate tasks for
+            // reading and writing.
+            let (reader, writer) = stream.split();
 
-        for event in events.iter() {
-            match event.token() {
-                SERVER => {
-                    println!("SERVER");
-                    // Accept and drop the socket immediately, this will close
-                    // the socket and notify the client of the EOF.
-                    let _ = server.accept();
-                }
-                CLIENT => {
-                    println!("CLIENT");
-                    // The server just shuts down the socket, let's just exit
-                    // from our event loop.
-                    //return;
-                }
-                _ => unreachable!(),
-            }
-        }
-    }
+            // Create a channel for our stream, which other sockets will use to
+            // send us messages. Then register our address with the stream to send
+            // data to us.
+            let (tx, rx) = futures::sync::mpsc::unbounded();
+            connections.lock().unwrap().insert(addr, tx);
+
+            // Define here what we do for the actual I/O. That is, read a bunch of
+            // lines from the socket and dispatch them while we also write any lines
+            // from other sockets.
+            let connections_inner = connections.clone();
+            let reader = BufReader::new(reader);
+
+            // Model the read portion of this socket by mapping an infinite
+            // iterator to each line off the socket. This "loop" is then
+            // terminated with an error once we hit EOF on the socket.
+            let iter = stream::iter_ok::<_, io::Error>(iter::repeat(()));
+
+            let socket_reader = iter.fold(reader, move |reader, _| {
+                // Read a line off the socket, failing if we're at EOF
+                let line = io::read_until(reader, b'\n', Vec::new());
+                let line = line.and_then(|(reader, vec)| {
+                    if vec.len() == 0 {
+                        Err(io::Error::new(io::ErrorKind::BrokenPipe, "broken pipe"))
+                    } else {
+                        Ok((reader, vec))
+                    }
+                });
+
+                // Convert the bytes we read into a string, and then send that
+                // string to all other connected clients.
+                let line = line.map(|(reader, vec)| {
+                    (reader, String::from_utf8(vec))
+                });
+
+                // Move the connection state into the closure below.
+                let connections = connections_inner.clone();
+
+                line.map(move |(reader, message)| {
+                    println!("{}: {:?}", addr, message);
+                    let mut conns = connections.lock().unwrap();
+
+                    if let Ok(msg) = message {
+                        // For each open connection except the sender, send the
+                        // string via the channel.
+                        let iter = conns.iter_mut()
+                            .filter(|&(&k, _)| k != addr)
+                            .map(|(_, v)| v);
+                        for tx in iter {
+                            tx.unbounded_send(format!("{}: {}", addr, msg)).unwrap();
+                        }
+                    } else {
+                        let tx = conns.get_mut(&addr).unwrap();
+                        tx.unbounded_send("You didn't send valid UTF-8.".to_string()).unwrap();
+                    }
+
+                    reader
+                })
+            });
+
+            // Whenever we receive a string on the Receiver, we write it to
+            // `WriteHalf<TcpStream>`.
+            let socket_writer = rx.fold(writer, |writer, msg| {
+                let amt = io::write_all(writer, msg.into_bytes());
+                let amt = amt.map(|(writer, _)| writer);
+                amt.map_err(|_| ())
+            });
+
+            // Now that we've got futures representing each half of the socket, we
+            // use the `select` combinator to wait for either half to be done to
+            // tear down the other. Then we spawn off the result.
+            let connections = connections.clone();
+            let socket_reader = socket_reader.map_err(|_| ());
+            let connection = socket_reader.map(|_| ()).select(socket_writer.map(|_| ()));
+
+            // Spawn a task to process the connection
+            tokio::spawn(connection.then(move |_| {
+                connections.lock().unwrap().remove(&addr);
+                println!("Connection {} closed.", addr);
+                Ok(())
+            }));
+
+            Ok(())
+        })
+        .map_err(|err| println!("error occurred: {:?}", err));
+
+    // execute server
+    tokio::run(srv);
+    Ok(())
 }
