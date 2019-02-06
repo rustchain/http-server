@@ -1,133 +1,162 @@
 #![deny(warnings)]
 
 extern crate tokio;
-extern crate futures;
 
-use tokio::io;
+use std::collections::HashMap;
+use std::io::BufReader;
+use std::env;
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+
+use tokio::io::{lines, write_all};
 use tokio::net::TcpListener;
 use tokio::prelude::*;
 
-use std::collections::HashMap;
-use std::iter;
-use std::env;
-use std::io::{BufReader};
-use std::sync::{Arc, Mutex};
+struct Database {
+    map: Mutex<HashMap<String, String>>,
+}
+
+/// Possible requests our clients can send us
+enum Request {
+    Get { key: String },
+    Set { key: String, value: String },
+}
+
+/// Responses to the `Request` commands above
+enum Response {
+    Value { key: String, value: String },
+    Set { key: String, value: String, previous: Option<String> },
+    Error { msg: String },
+}
 
 fn main() -> Result<(), Box<std::error::Error>> {
-
-    //TCP listener
+    // Parse the address we're going to run this server on
+    // and set up our TCP listener to accept connections.
     let addr = env::args().nth(1).unwrap_or("127.0.0.1:17771".to_string());
-    let addr = addr.parse()?;
-    let socket = TcpListener::bind(&addr)?;
-    println!("Start RCNode");
-    println!("listening on: {}", addr);
+    let addr = addr.parse::<SocketAddr>()?;
+    let listener = TcpListener::bind(&addr).map_err(|_| "failed to bind")?;
+    println!("Listening on: {}", addr);
 
+    // Create the shared state of this server that will be shared amongst all
+    // clients. We populate the initial database and then create the `Database`
+    // structure. Note the usage of `Arc` here which will be used to ensure that
+    // each independently spawned client will have a reference to the in-memory
+    // database.
+    let mut initial_db = HashMap::new();
+    initial_db.insert("foo".to_string(), "bar".to_string());
+    let db = Arc::new(Database {
+        map: Mutex::new(initial_db),
+    });
 
-    // Run Tokio runtime multi-threaded
-    // Arc<Mutex shared across the threads
-    let connections = Arc::new(Mutex::new(HashMap::new()));
+    let done = listener.incoming()
+        .map_err(|e| println!("error accepting socket; error = {:?}", e))
+        .for_each(move |socket| {
+            // As with many other small examples, the first thing we'll do is
+            // *split* this TCP stream into two separately owned halves. This'll
+            // allow us to work with the read and write halves independently.
+            let (reader, writer) = socket.split();
 
-    // The server task asynchronously iterates over and processes each incoming
-    // connection.
-    let srv = socket.incoming()
-        .map_err(|e| {println!("failed to accept socket; error = {:?}", e); e})
-        .for_each(move |stream| {
-            // The client's socket address
-            let addr = stream.peer_addr()?;
+            // Since our protocol is line-based we use `tokio_io`'s `lines` utility
+            // to convert our stream of bytes, `reader`, into a `Stream` of lines.
+            let lines = lines(BufReader::new(reader));
 
-            println!("New Connection: {}", addr);
+            // Here's where the meat of the processing in this server happens. First
+            // we see a clone of the database being created, which is creating a
+            // new reference for this connected client to use. Also note the `move`
+            // keyword on the closure here which moves ownership of the reference
+            // into the closure, which we'll need for spawning the client below.
+            //
+            // The `map` function here means that we'll run some code for all
+            // requests (lines) we receive from the client. The actual handling here
+            // is pretty simple, first we parse the request and if it's valid we
+            // generate a response based on the values in the database.
+            let db = db.clone();
+            let responses = lines.map(move |line| {
+                let request = match Request::parse(&line) {
+                    Ok(req) => req,
+                    Err(e) => return Response::Error { msg: e },
+                };
 
-            // Split the TcpStream into two separate handles. One handle for reading
-            // and one handle for writing. This lets us use separate tasks for
-            // reading and writing.
-            let (reader, writer) = stream.split();
-
-            // Create a channel for our stream, which other sockets will use to
-            // send us messages. Then register our address with the stream to send
-            // data to us.
-            let (tx, rx) = futures::sync::mpsc::unbounded();
-            connections.lock().unwrap().insert(addr, tx);
-
-            // Define here what we do for the actual I/O. That is, read a bunch of
-            // lines from the socket and dispatch them while we also write any lines
-            // from other sockets.
-            let connections_inner = connections.clone();
-            let reader = BufReader::new(reader);
-
-            // Model the read portion of this socket by mapping an infinite
-            // iterator to each line off the socket. This "loop" is then
-            // terminated with an error once we hit EOF on the socket.
-            let iter = stream::iter_ok::<_, io::Error>(iter::repeat(()));
-
-            let socket_reader = iter.fold(reader, move |reader, _| {
-                // Read a line off the socket, failing if we're at EOF
-                let line = io::read_until(reader, b'\n', Vec::new());
-                let line = line.and_then(|(reader, vec)| {
-                    if vec.len() == 0 {
-                        Err(io::Error::new(io::ErrorKind::BrokenPipe, "broken pipe"))
-                    } else {
-                        Ok((reader, vec))
-                    }
-                });
-
-                // Convert the bytes we read into a string, and then send that
-                // string to all other connected clients.
-                let line = line.map(|(reader, vec)| {
-                    (reader, String::from_utf8(vec))
-                });
-
-                // Move the connection state into the closure below.
-                let connections = connections_inner.clone();
-
-                line.map(move |(reader, message)| {
-                    println!("{}: {:?}", addr, message);
-                    let mut conns = connections.lock().unwrap();
-
-                    if let Ok(msg) = message {
-                        // For each open connection except the sender, send the
-                        // string via the channel.
-                        let iter = conns.iter_mut()
-                            .filter(|&(&k, _)| k != addr)
-                            .map(|(_, v)| v);
-                        for tx in iter {
-                            tx.unbounded_send(format!("{}: {}", addr, msg)).unwrap();
+                let mut db = db.map.lock().unwrap();
+                match request {
+                    Request::Get { key } => {
+                        match db.get(&key) {
+                            Some(value) => Response::Value { key, value: value.clone() },
+                            None => Response::Error { msg: format!("no key {}", key) },
                         }
-                    } else {
-                        let tx = conns.get_mut(&addr).unwrap();
-                        tx.unbounded_send("You didn't send valid UTF-8.".to_string()).unwrap();
                     }
-
-                    reader
-                })
+                    Request::Set { key, value } => {
+                        let previous = db.insert(key.clone(), value.clone());
+                        Response::Set { key, value, previous }
+                    }
+                }
             });
 
-            // Whenever we receive a string on the Receiver, we write it to
-            // `WriteHalf<TcpStream>`.
-            let socket_writer = rx.fold(writer, |writer, msg| {
-                let amt = io::write_all(writer, msg.into_bytes());
-                let amt = amt.map(|(writer, _)| writer);
-                amt.map_err(|_| ())
+            // At this point `responses` is a stream of `Response` types which we
+            // now want to write back out to the client. To do that we use
+            // `Stream::fold` to perform a loop here, serializing each response and
+            // then writing it out to the client.
+            let writes = responses.fold(writer, |writer, response| {
+                let mut response = response.serialize();
+                response.push('\n');
+                write_all(writer, response.into_bytes()).map(|(w, _)| w)
             });
 
-            // Now that we've got futures representing each half of the socket, we
-            // use the `select` combinator to wait for either half to be done to
-            // tear down the other. Then we spawn off the result.
-            let connections = connections.clone();
-            let socket_reader = socket_reader.map_err(|_| ());
-            let connection = socket_reader.map(|_| ()).select(socket_writer.map(|_| ()));
+            // Like with other small servers, we'll `spawn` this client to ensure it
+            // runs concurrently with all other clients, for now ignoring any errors
+            // that we see.
+            let msg = writes.then(move |_| Ok(()));
 
-            // Spawn a task to process the connection
-            tokio::spawn(connection.then(move |_| {
-                connections.lock().unwrap().remove(&addr);
-                println!("Connection {} closed.", addr);
-                Ok(())
-            }));
+            tokio::spawn(msg)
+        });
 
-            Ok(())
-        })
-        .map_err(|err| println!("error occurred: {:?}", err));
-
-    // execute server
-    tokio::run(srv);
+    tokio::run(done);
     Ok(())
+}
+
+impl Request {
+    fn parse(input: &str) -> Result<Request, String> {
+        let mut parts = input.splitn(3, " ");
+        match parts.next() {
+            Some("GET") => {
+                let key = match parts.next() {
+                    Some(key) => key,
+                    None => return Err(format!("GET must be followed by a key")),
+                };
+                if parts.next().is_some() {
+                    return Err(format!("GET's key must not be followed by anything"))
+                }
+                Ok(Request::Get { key: key.to_string() })
+            }
+            Some("SET") => {
+                let key = match parts.next() {
+                    Some(key) => key,
+                    None => return Err(format!("SET must be followed by a key")),
+                };
+                let value = match parts.next() {
+                    Some(value) => value,
+                    None => return Err(format!("SET needs a value")),
+                };
+                Ok(Request::Set { key: key.to_string(), value: value.to_string() })
+            }
+            Some(cmd) => Err(format!("unknown command: {}", cmd)),
+            None => Err(format!("empty input")),
+        }
+    }
+}
+
+impl Response {
+    fn serialize(&self) -> String {
+        match *self {
+            Response::Value { ref key, ref value } => {
+                format!("{} = {}", key, value)
+            }
+            Response::Set { ref key, ref value, ref previous } => {
+                format!("set {} = `{}`, previous: {:?}", key, value, previous)
+            }
+            Response::Error { ref msg } => {
+                format!("error: {}", msg)
+            }
+        }
+    }
 }
