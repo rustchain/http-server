@@ -1,162 +1,124 @@
 #![deny(warnings)]
+extern crate futures;
+extern crate hyper;
+extern crate pretty_env_logger;
+extern crate serde_json;
 
-extern crate tokio;
+use futures::{future, Future, Stream};
 
-use std::collections::HashMap;
-use std::io::BufReader;
-use std::env;
-use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use hyper::{Body, Chunk, Client, Method, Request, Response, Server, StatusCode, header};
+use hyper::client::HttpConnector;
+use hyper::service::service_fn;
 
-use tokio::io::{lines, write_all};
-use tokio::net::TcpListener;
-use tokio::prelude::*;
+#[allow(unused, deprecated)]
+use std::ascii::AsciiExt;
 
-struct Database {
-    map: Mutex<HashMap<String, String>>,
-}
+static NOTFOUND: &[u8] = b"Not Found";
+static URL: &str = "http://127.0.0.1:1337/web_api";
+static INDEX: &[u8] = b"<a href=\"test.html\">test.html</a>";
+static LOWERCASE: &[u8] = b"i am a lower case string";
 
-/// Possible requests our clients can send us
-enum Request {
-    Get { key: String },
-    Set { key: String, value: String },
-}
+fn response_examples(req: Request<Body>, client: &Client<HttpConnector>)
+                     -> Box<Future<Item=Response<Body>, Error=hyper::Error> + Send>
+{
+    match (req.method(), req.uri().path()) {
+        (&Method::GET, "/") | (&Method::GET, "/index.html") => {
+            let body = Body::from(INDEX);
+            Box::new(future::ok(Response::new(body)))
+        },
+        (&Method::GET, "/test.html") => {
+            // Run a web query against the web api below
 
-/// Responses to the `Request` commands above
-enum Response {
-    Value { key: String, value: String },
-    Set { key: String, value: String, previous: Option<String> },
-    Error { msg: String },
-}
+            // build the request
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri(URL)
+                .body(LOWERCASE.into())
+                .unwrap();
+            // use the request with client
+            let web_res_future = client.request(req);
 
-fn main() -> Result<(), Box<std::error::Error>> {
-    // Parse the address we're going to run this server on
-    // and set up our TCP listener to accept connections.
-    let addr = env::args().nth(1).unwrap_or("127.0.0.1:17771".to_string());
-    let addr = addr.parse::<SocketAddr>()?;
-    let listener = TcpListener::bind(&addr).map_err(|_| "failed to bind")?;
-    println!("Listening on: {}", addr);
+            Box::new(web_res_future.map(|web_res| {
+                // return the response that came from the web api and the original text together
+                // to show the difference
+                let body = Body::wrap_stream(web_res.into_body().map(|b| {
+                    Chunk::from(format!("<b>before</b>: {}<br><b>after</b>: {}",
+                                        std::str::from_utf8(LOWERCASE).unwrap(),
+                                        std::str::from_utf8(&b).unwrap()))
+                }));
 
-    // Create the shared state of this server that will be shared amongst all
-    // clients. We populate the initial database and then create the `Database`
-    // structure. Note the usage of `Arc` here which will be used to ensure that
-    // each independently spawned client will have a reference to the in-memory
-    // database.
-    let mut initial_db = HashMap::new();
-    initial_db.insert("foo".to_string(), "bar".to_string());
-    let db = Arc::new(Database {
-        map: Mutex::new(initial_db),
-    });
-
-    let done = listener.incoming()
-        .map_err(|e| println!("error accepting socket; error = {:?}", e))
-        .for_each(move |socket| {
-            // As with many other small examples, the first thing we'll do is
-            // *split* this TCP stream into two separately owned halves. This'll
-            // allow us to work with the read and write halves independently.
-            let (reader, writer) = socket.split();
-
-            // Since our protocol is line-based we use `tokio_io`'s `lines` utility
-            // to convert our stream of bytes, `reader`, into a `Stream` of lines.
-            let lines = lines(BufReader::new(reader));
-
-            // Here's where the meat of the processing in this server happens. First
-            // we see a clone of the database being created, which is creating a
-            // new reference for this connected client to use. Also note the `move`
-            // keyword on the closure here which moves ownership of the reference
-            // into the closure, which we'll need for spawning the client below.
-            //
-            // The `map` function here means that we'll run some code for all
-            // requests (lines) we receive from the client. The actual handling here
-            // is pretty simple, first we parse the request and if it's valid we
-            // generate a response based on the values in the database.
-            let db = db.clone();
-            let responses = lines.map(move |line| {
-                let request = match Request::parse(&line) {
-                    Ok(req) => req,
-                    Err(e) => return Response::Error { msg: e },
-                };
-
-                let mut db = db.map.lock().unwrap();
-                match request {
-                    Request::Get { key } => {
-                        match db.get(&key) {
-                            Some(value) => Response::Value { key, value: value.clone() },
-                            None => Response::Error { msg: format!("no key {}", key) },
-                        }
-                    }
-                    Request::Set { key, value } => {
-                        let previous = db.insert(key.clone(), value.clone());
-                        Response::Set { key, value, previous }
-                    }
+                Response::new(body)
+            }))
+        },
+        (&Method::POST, "/web_api") => {
+            // A web api to run against. Uppercases the body and returns it back.
+            let body = Body::wrap_stream(req.into_body().map(|chunk| {
+                // uppercase the letters
+                let upper = chunk.iter().map(|byte| byte.to_ascii_uppercase())
+                    .collect::<Vec<u8>>();
+                Chunk::from(upper)
+            }));
+            Box::new(future::ok(Response::new(body)))
+        },
+        (&Method::GET, "/json") => {
+            let data = vec!["foo", "bar"];
+            let res = match serde_json::to_string(&data) {
+                Ok(json) => {
+                    // return a json response
+                    Response::builder()
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(json))
+                        .unwrap()
                 }
-            });
+                // This is unnecessary here because we know
+                // this can't fail. But if we were serializing json that came from another
+                // source we could handle an error like this.
+                Err(e) => {
+                    eprintln!("serializing json: {}", e);
 
-            // At this point `responses` is a stream of `Response` types which we
-            // now want to write back out to the client. To do that we use
-            // `Stream::fold` to perform a loop here, serializing each response and
-            // then writing it out to the client.
-            let writes = responses.fold(writer, |writer, response| {
-                let mut response = response.serialize();
-                response.push('\n');
-                write_all(writer, response.into_bytes()).map(|(w, _)| w)
-            });
-
-            // Like with other small servers, we'll `spawn` this client to ensure it
-            // runs concurrently with all other clients, for now ignoring any errors
-            // that we see.
-            let msg = writes.then(move |_| Ok(()));
-
-            tokio::spawn(msg)
-        });
-
-    tokio::run(done);
-    Ok(())
-}
-
-impl Request {
-    fn parse(input: &str) -> Result<Request, String> {
-        let mut parts = input.splitn(3, " ");
-        match parts.next() {
-            Some("GET") => {
-                let key = match parts.next() {
-                    Some(key) => key,
-                    None => return Err(format!("GET must be followed by a key")),
-                };
-                if parts.next().is_some() {
-                    return Err(format!("GET's key must not be followed by anything"))
+                    Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .body(Body::from("Internal Server Error"))
+                        .unwrap()
                 }
-                Ok(Request::Get { key: key.to_string() })
-            }
-            Some("SET") => {
-                let key = match parts.next() {
-                    Some(key) => key,
-                    None => return Err(format!("SET must be followed by a key")),
-                };
-                let value = match parts.next() {
-                    Some(value) => value,
-                    None => return Err(format!("SET needs a value")),
-                };
-                Ok(Request::Set { key: key.to_string(), value: value.to_string() })
-            }
-            Some(cmd) => Err(format!("unknown command: {}", cmd)),
-            None => Err(format!("empty input")),
+            };
+
+            Box::new(future::ok(res))
+        }
+        _ => {
+            // Return 404 not found response.
+            let body = Body::from(NOTFOUND);
+            Box::new(future::ok(Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(body)
+                .unwrap()))
         }
     }
 }
 
-impl Response {
-    fn serialize(&self) -> String {
-        match *self {
-            Response::Value { ref key, ref value } => {
-                format!("{} = {}", key, value)
-            }
-            Response::Set { ref key, ref value, ref previous } => {
-                format!("set {} = `{}`, previous: {:?}", key, value, previous)
-            }
-            Response::Error { ref msg } => {
-                format!("error: {}", msg)
-            }
-        }
-    }
+fn main() {
+    pretty_env_logger::init();
+
+    let addr = "127.0.0.1:1337".parse().unwrap();
+
+    hyper::rt::run(future::lazy(move || {
+        // Share a `Client` with all `Service`s
+        let client = Client::new();
+
+        let new_service = move || {
+            // Move a clone of `client` into the `service_fn`.
+            let client = client.clone();
+            service_fn(move |req| {
+                response_examples(req, &client)
+            })
+        };
+
+        let server = Server::bind(&addr)
+            .serve(new_service)
+            .map_err(|e| eprintln!("server error: {}", e));
+
+        println!("Listening on http://{}", addr);
+
+        server
+    }));
 }
