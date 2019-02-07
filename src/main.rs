@@ -1,7 +1,6 @@
 #![deny(warnings)]
 extern crate futures;
 extern crate hyper;
-extern crate pretty_env_logger;
 extern crate serde_json;
 
 use futures::{future, Future, Stream};
@@ -13,7 +12,7 @@ use hyper::service::service_fn;
 #[allow(unused, deprecated)]
 use std::ascii::AsciiExt;
 
-static NOTFOUND: &[u8] = b"Not Found";
+static NOTFOUND: &[u8] = b"{\"result\":404}";
 static URL: &str = "http://127.0.0.1:1337/web_api";
 static INDEX: &[u8] = b"<a href=\"test.html\">test.html</a>";
 static LOWERCASE: &[u8] = b"i am a lower case string";
@@ -22,10 +21,14 @@ fn response_examples(req: Request<Body>, client: &Client<HttpConnector>)
                      -> Box<Future<Item=Response<Body>, Error=hyper::Error> + Send>
 {
     match (req.method(), req.uri().path()) {
+
+
         (&Method::GET, "/") | (&Method::GET, "/index.html") => {
             let body = Body::from(INDEX);
             Box::new(future::ok(Response::new(body)))
         },
+
+
         (&Method::GET, "/test.html") => {
             // Run a web query against the web api below
 
@@ -50,8 +53,9 @@ fn response_examples(req: Request<Body>, client: &Client<HttpConnector>)
                 Response::new(body)
             }))
         },
-        (&Method::POST, "/web_api") => {
-            // A web api to run against. Uppercases the body and returns it back.
+
+        //put trx in queue
+        (&Method::POST, "/web_api/tx") => {
             let body = Body::wrap_stream(req.into_body().map(|chunk| {
                 // uppercase the letters
                 let upper = chunk.iter().map(|byte| byte.to_ascii_uppercase())
@@ -60,6 +64,8 @@ fn response_examples(req: Request<Body>, client: &Client<HttpConnector>)
             }));
             Box::new(future::ok(Response::new(body)))
         },
+
+
         (&Method::GET, "/json") => {
             let data = vec!["foo", "bar"];
             let res = match serde_json::to_string(&data) {
@@ -70,9 +76,6 @@ fn response_examples(req: Request<Body>, client: &Client<HttpConnector>)
                         .body(Body::from(json))
                         .unwrap()
                 }
-                // This is unnecessary here because we know
-                // this can't fail. But if we were serializing json that came from another
-                // source we could handle an error like this.
                 Err(e) => {
                     eprintln!("serializing json: {}", e);
 
@@ -85,6 +88,8 @@ fn response_examples(req: Request<Body>, client: &Client<HttpConnector>)
 
             Box::new(future::ok(res))
         }
+
+        //unreachable
         _ => {
             // Return 404 not found response.
             let body = Body::from(NOTFOUND);
@@ -97,12 +102,12 @@ fn response_examples(req: Request<Body>, client: &Client<HttpConnector>)
 }
 
 fn main() {
-    pretty_env_logger::init();
 
-    let addr = "127.0.0.1:1337".parse().unwrap();
+
+    let addr = "127.0.0.1:17771".parse().unwrap();
 
     hyper::rt::run(future::lazy(move || {
-        // Share a `Client` with all `Service`s
+        // share client with all services
         let client = Client::new();
 
         let new_service = move || {
@@ -121,4 +126,7 @@ fn main() {
 
         server
     }));
+
+
+
 }
